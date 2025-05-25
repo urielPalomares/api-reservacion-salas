@@ -13,6 +13,8 @@ const moment = require('moment-timezone');
 const createReservation = (req, res) => {
   const { startTime, endTime, priority, resources, timezone } = req.body;
   
+  console.log('Datos recibidos:', req.body);
+  
   if (!ALLOWED_TIMEZONES.includes(timezone)) {
     return res.status(400).json({ error: 'Zona horaria no válida' });
   }
@@ -27,6 +29,8 @@ const createReservation = (req, res) => {
   
   const startUTC = convertToUTC(startTime, timezone);
   const endUTC = convertToUTC(endTime, timezone);
+  
+  console.log('Horarios convertidos a UTC:', { startUTC, endUTC });
   
   if (!isBusinessDay(startUTC)) {
     return res.status(400).json({ error: 'Solo se permiten reservas en días laborables' });
@@ -43,22 +47,30 @@ const createReservation = (req, res) => {
   
   checkCollisions(startUTC, endUTC, resources.projector, priority, (err, collision) => {
     if (err) {
+      console.error('Error en checkCollisions:', err);
       return res.status(500).json({ error: 'Error al verificar colisiones' });
     }
+
+    console.log('Resultado de colisión:', collision);
     
     if (collision) {
       if (collision.canDisplace) {
-        displaceReservation(collision.id, collision.timezone, () => {
+        displaceReservation(collision.id, collision.timezone, (err) => {
+          if (err) {
+            console.error('Error al desplazar reserva:', err);
+            return res.status(500).json({ error: 'Error al desplazar reserva existente' });
+          }
           insertReservation(startUTC, endUTC, priority, resources, timezone, res);
         });
       } else {
         findNextAvailable(startUTC, timezone, (err, nextSlot) => {
+          console.log('Próximo slot disponible:', nextSlot);
           if (err) {
             return res.status(500).json({ error: 'Error al buscar horario disponible' });
           }
           res.status(409).json({ 
             error: 'Conflicto de horario',
-            nextAvailable: nextSlot 
+            nextAvailable: nextSlot
           });
         });
       }
@@ -79,6 +91,8 @@ const getReservations = (req, res) => {
       ...row,
       startTime: convertFromUTC(row.startTime, row.timezone),
       endTime: convertFromUTC(row.endTime, row.timezone),
+      startTimeUTC: row.startTime,
+      endTimeUTC: row.endTime,
       projector: Boolean(row.projector)
     }));
     
@@ -113,7 +127,7 @@ const getNextAvailable = (req, res) => {
   });
 };
 
-// Revisar coliciones
+// Revisar colisiones
 function checkCollisions(startTime, endTime, needsProjector, priority, callback) {
   const query = `
     SELECT * FROM reservations 
@@ -122,8 +136,15 @@ function checkCollisions(startTime, endTime, needsProjector, priority, callback)
     OR (startTime >= ? AND endTime <= ?)
   `;
   
+  console.log('Verificando colisiones para:', { startTime, endTime });
+  
   db.all(query, [endTime, startTime, endTime, endTime, startTime, endTime], (err, rows) => {
-    if (err) return callback(err);
+    if (err) {
+      console.error('Error en query de colisiones:', err);
+      return callback(err);
+    }
+    
+    console.log('Reservas encontradas:', rows.length);
     
     if (rows.length === 0) return callback(null, null);
     
@@ -138,7 +159,7 @@ function checkCollisions(startTime, endTime, needsProjector, priority, callback)
         });
       }
       
-      // Colisión temporal (misma prioridad)
+      // Colisión temporal
       const canDisplace = priority === 'high' && row.priority === 'normal';
       return callback(null, { 
         id: row.id, 
@@ -155,18 +176,24 @@ function insertReservation(startTime, endTime, priority, resources, timezone, re
     VALUES (?, ?, ?, ?, ?, ?)
   `;
   
-  db.run(query, [
+  const params = [
     startTime, 
     endTime, 
     priority, 
     resources.projector ? 1 : 0,
     resources.capacity, 
     timezone
-  ], function(err) {
+  ];
+  
+  console.log('Insertando reserva con parámetros:', params);
+  
+  db.run(query, params, function(err) {
     if (err) {
       console.error('Error al insertar reserva:', err);
       return res.status(500).json({ error: 'Error al crear reserva' });
     }
+    
+    console.log('Reserva creada con ID:', this.lastID);
     
     res.status(201).json({ 
       id: this.lastID, 
@@ -200,7 +227,7 @@ function displaceReservation(reservationId, originalTimezone, callback) {
       }
       
       const newStartUTC = convertToUTC(nextSlot, row.timezone);
-      const newEndUTC = moment(newStartUTC).add(duration, 'minutes').format();
+      const newEndUTC = moment.utc(newStartUTC).add(duration, 'minutes').format();
       
       // Actualizar reserva con nuevo horario
       db.run(
@@ -216,37 +243,58 @@ function displaceReservation(reservationId, originalTimezone, callback) {
   });
 }
 
-// Buscar proximo espacio
+// Buscar próximo espacio disponible
 function findNextAvailable(fromTimeUTC, timezone, callback) {
   let currentTime = moment.utc(fromTimeUTC);
   const maxDays = 30;
   let daysChecked = 0;
+  
+  console.log('Buscando desde:', currentTime.format());
+  
+  // Avanzar al menos 30 minutos desde el tiempo actual
+  currentTime.add(30, 'minutes');
+  
+  // Redondear al próximo slot de 30 minutos
+  const minutes = currentTime.minute();
+  if (minutes > 0 && minutes < 30) {
+    currentTime.minute(30).second(0);
+  } else if (minutes > 30) {
+    currentTime.add(1, 'hour').minute(0).second(0);
+  }
   
   const checkSlot = () => {
     if (daysChecked > maxDays) {
       return callback(null, null);
     }
     
+    // Solo días laborables
     if (!isBusinessDay(currentTime)) {
       currentTime.add(1, 'day').startOf('day').hour(9).minute(0).second(0);
       daysChecked++;
       return checkSlot();
     }
     
-    if (currentTime.hour() >= 17 || currentTime.hour() < 9) {
-      if (currentTime.hour() >= 17) {
-        currentTime.add(1, 'day');
-      }
-      currentTime.hour(9).minute(0).second(0);
-      
-      if (!isBusinessDay(currentTime)) {
-        return checkSlot();
-      }
+    // Verificar horario de oficina
+    if (currentTime.hour() >= 17) {
+      currentTime.add(1, 'day').startOf('day').hour(9).minute(0).second(0);
       daysChecked++;
+      return checkSlot();
+    }
+    
+    if (currentTime.hour() < 9) {
+      currentTime.hour(9).minute(0).second(0);
     }
     
     const slotStart = currentTime.format();
     const slotEnd = currentTime.clone().add(1, 'hour').format();
+    
+    // Verificar que no exceda el horario de oficina
+    if (moment.utc(slotEnd).hour() > 17 || 
+        (moment.utc(slotEnd).hour() === 17 && moment.utc(slotEnd).minute() > 0)) {
+      currentTime.add(1, 'day').startOf('day').hour(9).minute(0).second(0);
+      daysChecked++;
+      return checkSlot();
+    }
     
     // Verificar si el slot está disponible
     db.all(
@@ -258,12 +306,35 @@ function findNextAvailable(fromTimeUTC, timezone, callback) {
       (err, rows) => {
         if (err) return callback(err);
         
+        console.log(`Slot ${slotStart} - ${slotEnd}: ${rows.length} conflictos`);
+        
         if (rows.length === 0) {
-          return callback(null, convertFromUTC(slotStart, timezone));
+          // Slot disponible
+          const localTime = convertFromUTC(slotStart, timezone);
+          console.log('Slot disponible encontrado:', localTime);
+          return callback(null, localTime, slotStart);
         }
         
-        // Siguiente slot de 30 minutos
-        // currentTime.add(30, 'minutes');
+        // Buscar el final de la última reserva conflictiva
+        let latestEnd = moment.utc(rows[0].endTime);
+        for (const row of rows) {
+          const rowEnd = moment.utc(row.endTime);
+          if (rowEnd.isAfter(latestEnd)) {
+            latestEnd = rowEnd;
+          }
+        }
+        
+        // Continuar desde el final de la reserva conflictiva
+        currentTime = latestEnd.clone();
+        
+        // Redondear al próximo slot de 30 minutos
+        const mins = currentTime.minute();
+        if (mins > 0 && mins < 30) {
+          currentTime.minute(30).second(0);
+        } else if (mins > 30) {
+          currentTime.add(1, 'hour').minute(0).second(0);
+        }
+        
         checkSlot();
       }
     );
