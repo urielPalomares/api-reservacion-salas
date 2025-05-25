@@ -63,9 +63,6 @@ const createReservation = (req, res) => {
         });
       }
     } else {
-      console.log('startUTC', startUTC);
-      console.log('endUTC', endUTC);
-      return res.status(400).json({ error: 'Solo se permiten reservas en días laborables' });
       insertReservation(startUTC, endUTC, priority, resources, timezone, res);
     }
   });
