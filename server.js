@@ -10,7 +10,8 @@ const PORT = process.env.PORT || 3001;
 // Configuración de CORS
 const corsOptions = {
   origin: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'],
-  credentials: true
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type']
 };
 
 // Middlewares
